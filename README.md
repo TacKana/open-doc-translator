@@ -31,6 +31,7 @@
 | LangGraph | 有状态代理的低级编排框架 | [woniu9524.github.io/langgraph](https://woniu9524.github.io/langgraph ) |
 | LangChain | LLM 应用开发框架 | [woniu9524.github.io/langchain](https://woniu9524.github.io/langchain ) |
 | Agno | 多代理系统框架 | [ikun.mintlify.app/introduction](https://ikun.mintlify.app/introduction ) |
+| verl | 强化学习训练框架 | [woniu9524.github.io/verl-doc](https://woniu9524.github.io/verl-doc/ ) |
 
 ---
 
