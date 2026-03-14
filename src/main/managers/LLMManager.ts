@@ -40,7 +40,8 @@ export class LLMManager {
           }
         ],
         max_tokens: Math.min(10, this.settings.max_tokens),
-        temperature: 0.1
+        temperature: 0.1,
+        stream: true // 开启流式响应
       })
 
       return response.status === 200
@@ -57,16 +58,17 @@ export class LLMManager {
     filePath: string,
     content: string,
     prompt: string,
-    _sourceHash: string
+    _sourceHash: string,
+    onChunk?: (chunk: string) => void
   ): Promise<TranslationResult> {
     try {
       const fileExt = filePath.split('.').pop()?.toLowerCase()
 
       // 根据文件类型选择不同的翻译策略
       if (fileExt === 'ipynb') {
-        return await this.translateJupyterNotebook(filePath, content, prompt, _sourceHash)
+        return await this.translateJupyterNotebook(filePath, content, prompt, _sourceHash, onChunk)
       } else {
-        return await this.translateMarkdown(filePath, content, prompt, _sourceHash)
+        return await this.translateMarkdown(filePath, content, prompt, _sourceHash, onChunk)
       }
     } catch (error) {
       return {
@@ -85,7 +87,8 @@ export class LLMManager {
     filePath: string,
     content: string,
     prompt: string,
-    _sourceHash: string
+    _sourceHash: string,
+    onChunk?: (chunk: string) => void
   ): Promise<TranslationResult> {
     try {
       const messages = [
@@ -99,23 +102,67 @@ export class LLMManager {
         }
       ]
 
-      const response = await this.client.post('/chat/completions', {
-        model: this.settings.model,
-        messages,
-        temperature: this.settings.temperature,
-        max_tokens: Math.min(this.settings.max_tokens, this.estimateTokens(content) * 2) // 使用配置的max_tokens
+      const response = await this.client.post(
+        '/chat/completions',
+        {
+          model: this.settings.model,
+          messages,
+          temperature: this.settings.temperature,
+          max_tokens: Math.min(this.settings.max_tokens, this.estimateTokens(content) * 2),
+          stream: true
+        },
+        {
+          responseType: 'stream'
+        }
+      )
+
+      let fullContent = ''
+      const stream = response.data
+      let buffer = ''
+
+      return new Promise((resolve, reject) => {
+        stream.on('data', (chunk: Buffer) => {
+          buffer += chunk.toString()
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || '' // 保持最后一行在 buffer 中，因为它可能不完整
+
+          for (const line of lines) {
+            const trimmedLine = line.trim()
+            if (trimmedLine === '') continue
+            if (trimmedLine.includes('data: [DONE]')) break
+            if (trimmedLine.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(trimmedLine.replace('data: ', ''))
+                const delta = data.choices[0]?.delta?.content || ''
+                if (delta) {
+                  fullContent += delta
+                  if (onChunk) {
+                    onChunk(delta)
+                  }
+                }
+              } catch (e) {
+                // 如果 JSON 解析失败，可能是因为 data 后面跟着的不是有效的 JSON，或者是跨行了
+                // 在 SSE 中，通常一个 data: 后面就是一个完整的 JSON，但偶尔会有异常
+                console.error('解析流数据失败:', e, trimmedLine)
+              }
+            }
+          }
+        })
+
+        stream.on('end', () => {
+          resolve({
+            filePath,
+            translatedContent: fullContent,
+            success: true
+          })
+        })
+
+        stream.on('error', (err: Error) => {
+          reject(new Error(`流式翻译Markdown文件失败: ${err.message}`))
+        })
       })
-
-      const translatedContent = response.data.choices[0]?.message?.content || ''
-
-      return {
-        filePath,
-        translatedContent,
-        success: true
-      }
     } catch (error) {
       console.log(error)
-
       throw new Error(`翻译Markdown文件失败: ${error}`)
     }
   }
@@ -127,7 +174,8 @@ export class LLMManager {
     filePath: string,
     content: string,
     prompt: string,
-    _sourceHash: string
+    _sourceHash: string,
+    onChunk?: (chunk: string) => void
   ): Promise<TranslationResult> {
     try {
       // 解析Jupyter Notebook JSON
@@ -170,7 +218,9 @@ export class LLMManager {
       }
 
       // 批量翻译所有markdown cells
-      const translationPromises = markdownCells.map(async (cellData) => {
+      // 注意：这里为了支持流式展示，我们还是按顺序翻译 cell，或者你可以考虑如何合并流
+      // 为了简单起见，按顺序翻译并在每个 cell 完成时通知 chunk
+      for (const cellData of markdownCells) {
         const messages = [
           {
             role: 'system',
@@ -182,47 +232,67 @@ export class LLMManager {
           }
         ]
 
-        try {
-          const response = await this.client.post('/chat/completions', {
+        const response = await this.client.post(
+          '/chat/completions',
+          {
             model: this.settings.model,
             messages,
             temperature: this.settings.temperature,
             max_tokens: Math.min(
               this.settings.max_tokens,
               this.estimateTokens(cellData.content) * 2
-            )
+            ),
+            stream: true
+          },
+          {
+            responseType: 'stream'
+          }
+        )
+
+        let cellTranslatedContent = ''
+        const stream = response.data
+        let buffer = ''
+
+        await new Promise<void>((resolve, reject) => {
+          stream.on('data', (chunk: Buffer) => {
+            buffer += chunk.toString()
+            const lines = buffer.split('\n')
+            buffer = lines.pop() || ''
+
+            for (const line of lines) {
+              const trimmedLine = line.trim()
+              if (trimmedLine === '') continue
+              if (trimmedLine.includes('data: [DONE]')) break
+              if (trimmedLine.startsWith('data: ')) {
+                try {
+                  const data = JSON.parse(trimmedLine.replace('data: ', ''))
+                  const delta = data.choices[0]?.delta?.content || ''
+                  if (delta) {
+                    cellTranslatedContent += delta
+                    if (onChunk) {
+                      onChunk(delta)
+                    }
+                  }
+                } catch (e) {
+                  console.error('解析流数据失败:', e, trimmedLine)
+                }
+              }
+            }
           })
 
-          const translatedContent = response.data.choices[0]?.message?.content || cellData.content
+          stream.on('end', () => {
+            if (cellData.isArray) {
+              translatedNotebook.cells[cellData.index].source = [cellTranslatedContent]
+            } else {
+              translatedNotebook.cells[cellData.index].source = cellTranslatedContent
+            }
+            resolve()
+          })
 
-          return {
-            index: cellData.index,
-            translatedContent,
-            isArray: cellData.isArray,
-            success: true
-          }
-        } catch (error) {
-          console.error(`翻译第${cellData.index}个cell失败:`, error)
-          return {
-            index: cellData.index,
-            translatedContent: cellData.content, // 翻译失败时保持原内容
-            isArray: cellData.isArray,
-            success: false
-          }
-        }
-      })
-
-      // 等待所有翻译完成
-      const translationResults = await Promise.all(translationPromises)
-
-      // 更新notebook中的翻译结果
-      for (const result of translationResults) {
-        if (result.isArray) {
-          // 将翻译结果重新分割为数组格式，保持原有的换行格式
-          translatedNotebook.cells[result.index].source = [result.translatedContent]
-        } else {
-          translatedNotebook.cells[result.index].source = result.translatedContent
-        }
+          stream.on('error', (err: Error) => {
+            reject(err)
+          })
+        })
       }
 
       return {

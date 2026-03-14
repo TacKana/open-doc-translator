@@ -25,7 +25,13 @@ export default tseslint.config(
     rules: {
       ...eslintPluginReactHooks.configs.recommended.rules,
       ...eslintPluginReactRefresh.configs.vite.rules,
-      'eol-last': 'off'
+      'prettier/prettier': [
+        'error',
+        {
+          singleQuote: true,
+          parser: 'flow'
+        }
+      ]
     }
   },
   eslintConfigPrettier
