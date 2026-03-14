@@ -9,9 +9,9 @@ export class LLMManager {
     this.settings = settings
     this.client = axios.create({
       baseURL: settings.base_url,
-      timeout: 60000, // 60秒超时
+      timeout: 60000 * 10, // 10分钟超时
       headers: {
-        'Authorization': `Bearer ${settings.api_key}`,
+        Authorization: `Bearer ${settings.api_key}`,
         'Content-Type': 'application/json'
       }
     })
@@ -42,7 +42,7 @@ export class LLMManager {
         max_tokens: Math.min(10, this.settings.max_tokens),
         temperature: 0.1
       })
-      
+
       return response.status === 200
     } catch (error) {
       console.error('LLM连接测试失败:', error)
@@ -61,7 +61,7 @@ export class LLMManager {
   ): Promise<TranslationResult> {
     try {
       const fileExt = filePath.split('.').pop()?.toLowerCase()
-      
+
       // 根据文件类型选择不同的翻译策略
       if (fileExt === 'ipynb') {
         return await this.translateJupyterNotebook(filePath, content, prompt, _sourceHash)
@@ -107,13 +107,15 @@ export class LLMManager {
       })
 
       const translatedContent = response.data.choices[0]?.message?.content || ''
-      
+
       return {
         filePath,
         translatedContent,
         success: true
       }
     } catch (error) {
+      console.log(error)
+
       throw new Error(`翻译Markdown文件失败: ${error}`)
     }
   }
@@ -141,13 +143,11 @@ export class LLMManager {
 
       for (let i = 0; i < translatedNotebook.cells.length; i++) {
         const cell = translatedNotebook.cells[i]
-        
+
         // 只处理markdown类型的cell
         if (cell.cell_type === 'markdown' && cell.source && cell.source.length > 0) {
           const isArray = Array.isArray(cell.source)
-          const cellContent = isArray 
-            ? cell.source.join('') 
-            : cell.source
+          const cellContent = isArray ? cell.source.join('') : cell.source
 
           // 如果内容不为空且包含非空白字符，则加入翻译队列
           if (cellContent.trim()) {
@@ -187,11 +187,14 @@ export class LLMManager {
             model: this.settings.model,
             messages,
             temperature: this.settings.temperature,
-            max_tokens: Math.min(this.settings.max_tokens, this.estimateTokens(cellData.content) * 2)
+            max_tokens: Math.min(
+              this.settings.max_tokens,
+              this.estimateTokens(cellData.content) * 2
+            )
           })
 
           const translatedContent = response.data.choices[0]?.message?.content || cellData.content
-          
+
           return {
             index: cellData.index,
             translatedContent,
@@ -243,11 +246,11 @@ export class LLMManager {
     const results: TranslationResult[] = []
     const concurrency = this.settings.concurrency
     let completedCount = 0
-    
+
     // 分批处理任务
     for (let i = 0; i < tasks.length; i += concurrency) {
       const batch = tasks.slice(i, i + concurrency)
-      
+
       // 并发处理当前批次
       const batchPromises = batch.map(async (task) => {
         try {
@@ -266,7 +269,7 @@ export class LLMManager {
             prompt,
             task.sourceHash
           )
-          
+
           // 更新进度 - 完成当前文件
           completedCount++
           if (onProgress) {
@@ -276,7 +279,7 @@ export class LLMManager {
               current: task.filePath
             })
           }
-          
+
           return result
         } catch (error) {
           completedCount++
@@ -287,7 +290,7 @@ export class LLMManager {
               current: task.filePath
             })
           }
-          
+
           return {
             filePath: task.filePath,
             translatedContent: '',
@@ -296,16 +299,16 @@ export class LLMManager {
           }
         }
       })
-      
+
       const batchResults = await Promise.all(batchPromises)
       results.push(...batchResults)
-      
+
       // 在批次之间添加短暂延迟，避免API限流
       if (i + concurrency < tasks.length) {
         await this.delay(1000) // 1秒延迟
       }
     }
-    
+
     return results
   }
 
@@ -313,7 +316,7 @@ export class LLMManager {
    * 延迟函数
    */
   private delay(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms))
+    return new Promise((resolve) => setTimeout(resolve, ms))
   }
 
   /**
@@ -324,7 +327,7 @@ export class LLMManager {
     const englishChars = text.match(/[a-zA-Z\s]/g)?.length || 0
     const chineseChars = text.match(/[\u4e00-\u9fa5]/g)?.length || 0
     const otherChars = text.length - englishChars - chineseChars
-    
+
     return Math.ceil(englishChars / 4 + chineseChars / 1.5 + otherChars / 3)
   }
 
@@ -337,13 +340,7 @@ export class LLMManager {
       return response.data.data?.map((model: any) => model.id) || []
     } catch {
       // 如果API不支持获取模型列表，返回常见模型
-      return [
-        'gpt-4-turbo',
-        'gpt-4',
-        'gpt-3.5-turbo',
-        'claude-3-sonnet',
-        'claude-3-haiku'
-      ]
+      return ['gpt-4-turbo', 'gpt-4', 'gpt-3.5-turbo', 'claude-3-sonnet', 'claude-3-haiku']
     }
   }
-} 
+}
