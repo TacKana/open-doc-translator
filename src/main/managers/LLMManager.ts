@@ -4,6 +4,7 @@ import { LLMSettings, TranslationTask, TranslationResult } from '../types'
 export class LLMManager {
   private client: AxiosInstance
   private settings: LLMSettings
+  private readonly MAX_CHUNK_TOKENS = 2000
 
   constructor(settings: LLMSettings) {
     this.settings = settings
@@ -91,76 +92,19 @@ export class LLMManager {
     onChunk?: (chunk: string) => void
   ): Promise<TranslationResult> {
     try {
-      const messages = [
-        {
-          role: 'system',
-          content: prompt
-        },
-        {
-          role: 'user',
-          content: content
-        }
-      ]
+      const chunks = this.splitMarkdownContent(content)
+      let translatedContent = ''
 
-      const response = await this.client.post(
-        '/chat/completions',
-        {
-          model: this.settings.model,
-          messages,
-          temperature: this.settings.temperature,
-          max_tokens: Math.min(this.settings.max_tokens, this.estimateTokens(content) * 2),
-          stream: true
-        },
-        {
-          responseType: 'stream'
-        }
-      )
+      for (const chunk of chunks) {
+        const translatedChunk = await this.translateTextStream(chunk, prompt, onChunk)
+        translatedContent += translatedChunk
+      }
 
-      let fullContent = ''
-      const stream = response.data
-      let buffer = ''
-
-      return new Promise((resolve, reject) => {
-        stream.on('data', (chunk: Buffer) => {
-          buffer += chunk.toString()
-          const lines = buffer.split('\n')
-          buffer = lines.pop() || '' // 保持最后一行在 buffer 中，因为它可能不完整
-
-          for (const line of lines) {
-            const trimmedLine = line.trim()
-            if (trimmedLine === '') continue
-            if (trimmedLine.includes('data: [DONE]')) break
-            if (trimmedLine.startsWith('data: ')) {
-              try {
-                const data = JSON.parse(trimmedLine.replace('data: ', ''))
-                const delta = data.choices[0]?.delta?.content || ''
-                if (delta) {
-                  fullContent += delta
-                  if (onChunk) {
-                    onChunk(delta)
-                  }
-                }
-              } catch (e) {
-                // 如果 JSON 解析失败，可能是因为 data 后面跟着的不是有效的 JSON，或者是跨行了
-                // 在 SSE 中，通常一个 data: 后面就是一个完整的 JSON，但偶尔会有异常
-                console.error('解析流数据失败:', e, trimmedLine)
-              }
-            }
-          }
-        })
-
-        stream.on('end', () => {
-          resolve({
-            filePath,
-            translatedContent: fullContent,
-            success: true
-          })
-        })
-
-        stream.on('error', (err: Error) => {
-          reject(new Error(`流式翻译Markdown文件失败: ${err.message}`))
-        })
-      })
+      return {
+        filePath,
+        translatedContent,
+        success: true
+      }
     } catch (error) {
       console.log(error)
       throw new Error(`翻译Markdown文件失败: ${error}`)
@@ -221,78 +165,19 @@ export class LLMManager {
       // 注意：这里为了支持流式展示，我们还是按顺序翻译 cell，或者你可以考虑如何合并流
       // 为了简单起见，按顺序翻译并在每个 cell 完成时通知 chunk
       for (const cellData of markdownCells) {
-        const messages = [
-          {
-            role: 'system',
-            content: prompt
-          },
-          {
-            role: 'user',
-            content: cellData.content
-          }
-        ]
-
-        const response = await this.client.post(
-          '/chat/completions',
-          {
-            model: this.settings.model,
-            messages,
-            temperature: this.settings.temperature,
-            max_tokens: Math.min(
-              this.settings.max_tokens,
-              this.estimateTokens(cellData.content) * 2
-            ),
-            stream: true
-          },
-          {
-            responseType: 'stream'
-          }
-        )
-
+        const chunks = this.splitMarkdownContent(cellData.content)
         let cellTranslatedContent = ''
-        const stream = response.data
-        let buffer = ''
 
-        await new Promise<void>((resolve, reject) => {
-          stream.on('data', (chunk: Buffer) => {
-            buffer += chunk.toString()
-            const lines = buffer.split('\n')
-            buffer = lines.pop() || ''
+        for (const chunk of chunks) {
+          const translatedChunk = await this.translateTextStream(chunk, prompt, onChunk)
+          cellTranslatedContent += translatedChunk
+        }
 
-            for (const line of lines) {
-              const trimmedLine = line.trim()
-              if (trimmedLine === '') continue
-              if (trimmedLine.includes('data: [DONE]')) break
-              if (trimmedLine.startsWith('data: ')) {
-                try {
-                  const data = JSON.parse(trimmedLine.replace('data: ', ''))
-                  const delta = data.choices[0]?.delta?.content || ''
-                  if (delta) {
-                    cellTranslatedContent += delta
-                    if (onChunk) {
-                      onChunk(delta)
-                    }
-                  }
-                } catch (e) {
-                  console.error('解析流数据失败:', e, trimmedLine)
-                }
-              }
-            }
-          })
-
-          stream.on('end', () => {
-            if (cellData.isArray) {
-              translatedNotebook.cells[cellData.index].source = [cellTranslatedContent]
-            } else {
-              translatedNotebook.cells[cellData.index].source = cellTranslatedContent
-            }
-            resolve()
-          })
-
-          stream.on('error', (err: Error) => {
-            reject(err)
-          })
-        })
+        if (cellData.isArray) {
+          translatedNotebook.cells[cellData.index].source = [cellTranslatedContent]
+        } else {
+          translatedNotebook.cells[cellData.index].source = cellTranslatedContent
+        }
       }
 
       return {
@@ -399,6 +284,142 @@ export class LLMManager {
     const otherChars = text.length - englishChars - chineseChars
 
     return Math.ceil(englishChars / 4 + chineseChars / 1.5 + otherChars / 3)
+  }
+
+  /**
+   * 将 Markdown 内容拆分为更小的块，以避免超过 LLM 的输出限制
+   */
+  private splitMarkdownContent(
+    content: string,
+    maxTokens: number = this.MAX_CHUNK_TOKENS
+  ): string[] {
+    // 首先按标题拆分
+    const sections = content.split(/(?=\n#+ )/)
+    const chunks: string[] = []
+    let currentChunk = ''
+
+    for (const section of sections) {
+      const sectionTokens = this.estimateTokens(section)
+
+      // 如果单个 section 就超过了限制，需要进一步拆分
+      if (sectionTokens > maxTokens) {
+        // 如果 currentChunk 不为空，先存入 chunks
+        if (currentChunk) {
+          chunks.push(currentChunk)
+          currentChunk = ''
+        }
+
+        // 按段落拆分
+        const paragraphs = section.split(/\n\n+/)
+        let pChunk = ''
+        for (const p of paragraphs) {
+          const pTokens = this.estimateTokens(p)
+          // 如果单个段落还是太大，只能按行拆分
+          if (pTokens > maxTokens) {
+            if (pChunk) {
+              chunks.push(pChunk)
+              pChunk = ''
+            }
+            const lines = p.split('\n')
+            let lChunk = ''
+            for (const l of lines) {
+              if (this.estimateTokens(lChunk + '\n' + l) > maxTokens) {
+                if (lChunk) chunks.push(lChunk)
+                lChunk = l
+              } else {
+                lChunk = lChunk ? lChunk + '\n' + l : l
+              }
+            }
+            if (lChunk) pChunk = lChunk
+          } else if (this.estimateTokens(pChunk + '\n\n' + p) > maxTokens) {
+            if (pChunk) chunks.push(pChunk)
+            pChunk = p
+          } else {
+            pChunk = pChunk ? pChunk + '\n\n' + p : p
+          }
+        }
+        if (pChunk) chunks.push(pChunk)
+      } else if (this.estimateTokens(currentChunk + section) > maxTokens) {
+        if (currentChunk) chunks.push(currentChunk)
+        currentChunk = section
+      } else {
+        currentChunk += section
+      }
+    }
+
+    if (currentChunk) {
+      chunks.push(currentChunk)
+    }
+
+    return chunks
+  }
+
+  /**
+   * 通过流式 API 翻译文本内容
+   */
+  private async translateTextStream(
+    text: string,
+    prompt: string,
+    onChunk?: (chunk: string) => void
+  ): Promise<string> {
+    const messages = [
+      {
+        role: 'system',
+        content: prompt
+      },
+      {
+        role: 'user',
+        content: text
+      }
+    ]
+
+    const response = await this.client.post(
+      '/chat/completions',
+      {
+        model: this.settings.model,
+        messages,
+        temperature: this.settings.temperature,
+        max_tokens: Math.min(this.settings.max_tokens, this.estimateTokens(text) * 2),
+        stream: true
+      },
+      {
+        responseType: 'stream'
+      }
+    )
+
+    let fullContent = ''
+    const stream = response.data
+    let buffer = ''
+
+    return new Promise((resolve, reject) => {
+      stream.on('data', (chunk: Buffer) => {
+        buffer += chunk.toString()
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+
+        for (const line of lines) {
+          const trimmedLine = line.trim()
+          if (trimmedLine === '' || trimmedLine === 'data: [DONE]') continue
+          if (trimmedLine.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(trimmedLine.replace('data: ', ''))
+              const delta = data.choices[0]?.delta?.content || ''
+              if (delta) {
+                fullContent += delta
+                if (onChunk) {
+                  onChunk(delta)
+                }
+              }
+            } catch (e) {
+              console.error('解析流数据失败:', e, trimmedLine)
+            }
+          }
+        }
+      })
+
+      stream.on('end', () => resolve(fullContent))
+      stream.on('error', (err: Error) => reject(err))
+    })
   }
 
   /**
